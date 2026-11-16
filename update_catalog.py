@@ -17,6 +17,7 @@ import argparse
 import datetime as dt
 import json
 import re
+import struct
 import sys
 import time
 import urllib.parse
@@ -25,9 +26,53 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 CATALOG = ROOT / "catalog.json"
+CATALOG_BIN = ROOT / "catalog.bin"
 NAV_PAGE = "Template:剧情导航"
 USER_AGENT = "ArknightsStoryReader/1.0 (catalog publisher)"
 API = "https://prts.wiki/index.php?"
+
+# Binary layout shared with the ESP32 firmware. Strings are UTF-8, NUL padded.
+# Header: magic[4], version/u32, arc_count/u16, episode_count/u16, reserved/u32
+# Arc:    name[64], type[16], first_episode/u16, episode_count/u16
+# Episode: title[128], label[128]
+BIN_MAGIC = b"AKC1"
+ARC_NAME = 64
+ARC_TYPE = 16
+EP_TITLE = 128
+EP_LABEL = 128
+ARC_RECORD = ARC_NAME + ARC_TYPE + 4
+EP_RECORD = EP_TITLE + EP_LABEL
+
+
+def put_text(buffer: bytearray, offset: int, text: str, size: int) -> None:
+    raw = text.encode("utf-8")
+    if len(raw) >= size:
+        raw = raw[: size - 1]
+        while raw and (raw[-1] & 0xC0) == 0x80:
+            raw = raw[:-1]
+    buffer[offset : offset + len(raw)] = raw
+
+
+def write_binary(arcs: list[dict], revision: int) -> None:
+    episodes = [ep for arc in arcs for ep in arc["episodes"]]
+    header = struct.pack("<4sIHHI", BIN_MAGIC, revision & 0xFFFFFFFF,
+                         len(arcs), len(episodes), 0)
+    output = bytearray(header)
+    first = 0
+    for arc in arcs:
+        record = bytearray(ARC_RECORD)
+        put_text(record, 0, arc["name"], ARC_NAME)
+        put_text(record, ARC_NAME, arc.get("type", "其他"), ARC_TYPE)
+        struct.pack_into("<HH", record, ARC_NAME + ARC_TYPE, first,
+                         len(arc["episodes"]))
+        output += record
+        first += len(arc["episodes"])
+    for episode in episodes:
+        record = bytearray(EP_RECORD)
+        put_text(record, 0, episode["title"], EP_TITLE)
+        put_text(record, EP_TITLE, episode["label"], EP_LABEL)
+        output += record
+    CATALOG_BIN.write_bytes(output)
 
 
 def fetch_nav() -> str:
@@ -152,6 +197,10 @@ def main() -> int:
         arcs, added = merge_append_only(existing, fresh)
         if added == 0 and existing:
             print("catalog unchanged")
+            if not CATALOG_BIN.exists():
+                data = json.loads(CATALOG.read_text(encoding="utf-8"))
+                write_binary(arcs, int(data.get("revision", 0)))
+                print(f"wrote {CATALOG_BIN.name} from existing catalog")
             return 0
 
     episodes = sum(len(arc["episodes"]) for arc in arcs)
@@ -170,7 +219,9 @@ def main() -> int:
         encoding="utf-8",
         newline="\n",
     )
+    write_binary(arcs, revision)
     print(f"wrote {CATALOG.name}: {len(arcs)} arcs, {episodes} episodes")
+    print(f"wrote {CATALOG_BIN.name}")
     return 0
 
 
